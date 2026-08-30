@@ -1,44 +1,29 @@
 ---
 name: agent-ops-author
-description: Optimize token use by converting repeated safe DevOps reasoning and verbose command sequences into reusable agent-ops scripts or constrained runbooks. Prefer reuse and composition before adding code. Allow the agent to add new operation modules in the same structure when a reuse opportunity spans multiple sessions. Do not use for Git or remote mutation.
+description: Spend tokens once by turning repeated safe DevOps diagnostics into reusable agent-ops runbooks or operations. Prefer reuse/runbook before code; add a module only for cross-session reuse. Read-only diagnostics only; no Git, no remote mutation.
 ---
 
 # Agent Ops Author
 
-The primary goal is to spend tokens once on a reusable implementation instead of repeatedly constructing commands, parsing noisy output, and rediscovering the same diagnostic workflow.
+Turn repeated diagnostics into reusable code so the agent spends tokens once, not every session. Work in a source checkout (`<checkout>`, cloned from the repo or supplied by the caller); never edit site-packages or infer a checkout from a pip/pipx launcher. Read `src/agent_ops/`, `tests/`, `agent-ops operations`, and the usage skill first.
 
-Extend a source checkout without redesigning the library. Use the checkout supplied by the caller or clone `https://github.com/pandew-home/agentic-reuse.git`; do not infer a checkout from a pip/pipx launcher. Inspect `<checkout>/src/agent_ops/`, `<checkout>/tests/`, `agent-ops operations`, and the usage skill before editing. Never edit site-packages. Preserve concurrent changes.
+## Decision ladder
 
-## Compose First
+1. **Reuse** an existing operation (`agent-ops operations`) when it fits.
+2. **Compose** a constrained JSON runbook of existing operations for a repeatable multi-step check.
+3. **Add a module** only when a stable, read-only diagnostic recurs across sessions and a runbook cannot express it (see below).
 
-1. Identify repetition: commands rebuilt across sessions, verbose output repeatedly analyzed, duplicated fallback logic, and stable facts agents repeatedly extract.
-2. Record current output bytes and lines, sensitive fields, and the compact facts actually needed.
-3. Reuse an existing operation when possible. Otherwise compose registered operations in a constrained JSON runbook.
-4. Add Python only when composition cannot express the reusable workflow, and only as a new module under `<checkout>/src/agent_ops/` following the existing structure (see "Adding a new operation module"). Never create one-off shell wrappers, edit site-packages, or auto-load repository Python plugins.
+Never write one-off shell wrappers or auto-load repository plugins.
 
-## Safety Boundary
+## Safety boundary
 
-Classify additions as read-only diagnostics or managed EKS kubeconfig cache mutation. Reject remote deploy, sync, apply, restart, scale, rollback, delete, exec, port-forward, follow, pull/build/up, retry/cancel/play/approve, discovery, arbitrary command passthrough, `shell=True`, unknown flag forwarding, and implicit contexts. Git remains `agent-git`.
+Additions are **read-only diagnostics** or the single accepted mutation (managed EKS kubeconfig cache). Reject: deploy/sync/apply/restart/scale/rollback/delete/exec/port-forward/follow/build-up/retry/approve, discovery, arbitrary passthrough, `shell=True`, unknown flag forwarding, and implicit contexts. Git stays in `agent-git`.
 
-Every registered operation defines its public name, required explicit targets, fixed argv, parser, compact summary, timeout, byte/item bounds, runbook eligibility, and mutation class. Use standard-library Python, machine-readable upstream output, `agent_ops.core.run`, the shared envelope, and stable findings/errors.
+Every operation: explicit targets, fixed argv via `core.run` (`shell=False`), machine-readable upstream output, bounded strings/bytes/lines/items/duration/concurrency, `meta.truncated`/`meta.omitted` set, redaction via `sanitize`/`redact_text`, and the shared `agent-ops/v1` envelope. Exit codes: `0` ok, `2` usage/schema, `3` safety/target, `4` dependency/auth, `5` timeout/exec, `6` malformed upstream. Never return kubeconfigs, credentials, env dumps, Secret data, or auth config; redact secret keys/headers/URLs/keys before errors leave the process.
 
-Required exit classes are `0` completed, `2` usage/schema, `3` safety/target, `4` dependency/auth, `5` execution/timeout, and `6` malformed upstream output.
+## Add a module
 
-Bound strings, bytes, lines, items, subprocess duration, and concurrency. Set `meta.truncated` and `meta.omitted`. Never return kubeconfig contents, AWS/Kion credentials, environment dumps, registry auth, Kubernetes Secret data, or CLI auth configuration. Redact secret-like keys, auth headers, credential URLs, AWS key patterns, environment assignments, and private keys before errors leave the process.
-
-## Adding a new operation module
-
-When the `meta` feedback or repeated sessions show a stable, read-only diagnostic workflow that recurs across multiple sessions and cannot be expressed as a runbook of existing operations, add a new module under `<checkout>/src/agent_ops/` following the same structure as `operations.py`. This is the only sanctioned way to extend the tool surface; never write one-off shell wrappers or auto-load repository plugins.
-
-### When to add one
-
-- The same diagnostic is rebuilt across sessions — the `meta` signal shows high `ingested_bytes` against a small `envelope_bytes` with repeated calls.
-- No existing operation covers the domain, and a runbook of existing operations cannot express it.
-- It is read-only diagnostics, or the single accepted mutation class (managed EKS kubeconfig cache). Reject everything else.
-
-### Module structure
-
-Create `src/agent_ops/<domain>.py`:
+When `meta` shows high `ingested_bytes` vs small `envelope_bytes` across repeated calls and no operation covers it, create `src/agent_ops/<domain>.py`:
 
 ```python
 from .core import Context, OpsError, bounded, finding, run, run_json
@@ -50,51 +35,26 @@ def domain_action(ctx, args):
     target = args.get("target")
     if not isinstance(target, str) or not target or target.startswith("-"):
         raise OpsError("invalid_target", "Target must be an explicit, non-flag value", 3)
-    argv = ["kubectl", "--context", target, "get", "thing", "-o", "json"]
-    doc = run_json(ctx, argv)  # fixed argv, shell=False
+    doc = run_json(ctx, ["kubectl", "--context", target, "get", "thing", "-o", "json"])  # fixed argv, shell=False
     if not isinstance(doc, dict) or not isinstance(doc.get("items"), list):
         raise OpsError("malformed_output", "Upstream response missing items list", 6)
     items = bounded(doc["items"], ctx)
     findings = [finding("warning", "thing_unhealthy", "Thing needs attention", target, {})] if not items else []
-    status = "degraded" if findings else "healthy"
-    return ctx.success(status=status, target={"id": target}, summary={"count": len(items)}, findings=findings, data={"items": items})
+    return ctx.success(status="degraded" if findings else "healthy", target={"id": target}, summary={"count": len(items)}, findings=findings, data={"items": items})
 ```
 
-Rules:
+Rules: name is `domain.action` (lower-case, dotted); `required` = explicit targets, `allowed` = other args, `executables` = tools, `runbook=True` for composability, `mutation="none"` (or `"local_cache"` for EKS), with a `timeout`. Validate targets via `OpsError("invalid_target", ..., 3)`. Return `ctx.success(...)` so the envelope and `meta` metrics are produced automatically.
 
-- Decorate every entry point with `@operation`. The name is `domain.action` (lower-case, dotted). `required` lists explicit targets; `allowed` lists the only other accepted args; `executables` lists external tools; `runbook=True` makes it composable; `mutation="none"` (or `"local_cache"` only for EKS) with a `timeout`.
-- Build fixed argument vectors through `core.run`/`run_json` (`shell=False`). Never use `shell=True`, implicit contexts, or unknown flag forwarding.
-- Validate every target and reject bad input with `OpsError("invalid_target", ..., 3)`, mirroring the `_target_id`/`_safe_value` guards in `operations.py`.
-- Bound output with `bounded()` and let `meta.truncated`/`meta.omitted` be set; rely on `sanitize`/`redact_text` for redaction — never return secrets.
-- Return `ctx.success(...)` so the shared `agent-ops/v1` envelope and `meta` metrics are produced automatically.
+**Register**: import once in `operations.py` — `from . import <domain>` — so the `@operation` decorators populate `REGISTRY`. Do not edit `REGISTRY` directly.
 
-### Wiring registration
+## Verify
 
-The registry populates from `@operation` decorators at import time, so the new module must be imported. Add one line to `operations.py`:
-
-```python
-from . import <domain>  # registers domain.* operations
-```
-
-Do not mutate `REGISTRY` by hand. After import, `agent-ops operations` lists the new entries.
-
-### Tests and rollout
-
-Add cases to `tests/test_agent_ops.py` using the existing `FAKE` executable harness: success, auth failure (`fake-auth`), timeout (`fake-timeout`), malformed (`fake-malformed`), oversized (`fake-noisy`), redaction, and mutation refusal. Run the verification block below; only after it passes, update the command list in `skills/agent-ops/SKILL.md` and confirm agent discovery.
-
-## Blocking Tests
-
-Use `unittest` and fake executables prepended to `PATH`. Cover success, auth failure, timeout, malformed/noisy/oversized output, secrets, truncation, partial capability, omitted targets, unknown flags, and mutation rejection. Fixtures contain no credentials, kubeconfigs, production output, or auth files.
-
-Use the runtime `meta` feedback to decide when reuse pays off. Every `agent-ops` call reports `captured_bytes`, `dropped_bytes`, `ingested_bytes`, and `envelope_bytes` in `meta`. A recurring diagnostic with high `ingested_bytes` against a small `envelope_bytes` is a candidate for a runbook (compose first) or a new registered operation. Do not fabricate savings; rely on these measured fields and the blocking tests below.
-
-Before exposing an operation, run:
+Add `tests/test_agent_ops.py` cases using the `FAKE` executable harness: success, auth (`fake-auth`), timeout (`fake-timeout`), malformed (`fake-malformed`), oversized (`fake-noisy`), redaction, mutation refusal. Then from `<checkout>`:
 
 ```bash
-cd <checkout>
 PYTHONPYCACHEPREFIX=/tmp/agentic-reuse-compile python3 -m compileall -q src tests
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 agent-ops operations
 ```
 
-Only after tests pass, update the usage skill operation list and verify Kilo, Grok, and Claude discovery.
+Only after tests pass, update `skills/agent-ops/SKILL.md` command list and confirm agent discovery. Use `meta` to pick what to extract next; do not fabricate savings.
