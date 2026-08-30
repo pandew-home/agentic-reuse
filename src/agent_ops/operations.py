@@ -401,9 +401,9 @@ def _gitops_target(target, deadline=None):
                 mismatch = finding("critical", "destination_mismatch", "Argo application destination does not match expected EKS cluster", app_name, {"expected": expected, "observed": observed})
                 findings.append(mismatch)
         status = "critical" if "critical" in app_statuses or any(x["severity"] == "critical" for x in findings) else "degraded" if "degraded" in app_statuses or any(x["severity"] == "warning" for x in findings) else "healthy"
-        return {"id": target["id"], "ok": True, "status": status, "kubernetes": kh["summary"], "apps": apps, "findings": findings, "commands_run": local.commands_run, "truncated": local.truncated, "omitted": local.omitted, "dropped_bytes": local.dropped_bytes}
+        return {"id": target["id"], "ok": True, "status": status, "kubernetes": kh["summary"], "apps": apps, "findings": findings, "commands_run": local.commands_run, "truncated": local.truncated, "omitted": local.omitted, "dropped_bytes": local.dropped_bytes, "captured_bytes": local.captured_bytes}
     except OpsError as exc:
-        return {"id": target.get("id"), "ok": False, "status": "error", "error": {"code": exc.code, "message": exc.message}, "commands_run": local.commands_run, "truncated": local.truncated, "omitted": local.omitted, "dropped_bytes": local.dropped_bytes}
+        return {"id": target.get("id"), "ok": False, "status": "error", "error": {"code": exc.code, "message": exc.message}, "commands_run": local.commands_run, "truncated": local.truncated, "omitted": local.omitted, "dropped_bytes": local.dropped_bytes, "captured_bytes": local.captured_bytes}
 
 
 @operation("gitops.multicluster", required=("targets",), allowed=("concurrency", "fail_fast"), executables=("aws", "kubectl", "argocd"), runbook=True, mutation="local_cache", timeout=300)
@@ -429,6 +429,7 @@ def gitops_multicluster(ctx, args):
     ctx.truncated = ctx.truncated or any(x.pop("truncated", False) for x in results)
     ctx.omitted += sum(x.pop("omitted", 0) for x in results)
     ctx.dropped_bytes += sum(x.pop("dropped_bytes", 0) for x in results)
+    ctx.captured_bytes += sum(x.pop("captured_bytes", 0) for x in results)
     failed = sum(not x["ok"] for x in results)
     critical = sum(x["status"] == "critical" for x in results)
     degraded = sum(x["status"] == "degraded" for x in results)

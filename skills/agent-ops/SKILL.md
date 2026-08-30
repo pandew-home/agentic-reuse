@@ -18,6 +18,19 @@ Supply every explicit target. Never substitute the current kube context, Argo co
 
 Read output in this order: `ok`, `status`, `summary`, `findings`, then only relevant `data` branches. Treat `unknown` as missing evidence, not health. Do not send output through lossy RTK rewriting.
 
+## Self-measurement
+
+Every envelope carries real, measured `meta` (no estimates) so you can see the savings per call and decide when to refine the library:
+
+- `captured_bytes` — raw bytes read from upstream tools this call.
+- `dropped_bytes` — bytes discarded past the capture cap (`MAX_CAPTURE`).
+- `ingested_bytes` — `captured_bytes + dropped_bytes`, the total the tool absorbed.
+- `envelope_bytes` — size of the JSON actually returned to you.
+
+Compare `ingested_bytes` to `envelope_bytes` to gauge compression. High `ingested_bytes` with a small `envelope_bytes` means the tool absorbed a lot of verbose upstream output on your behalf. `meta` is accounting, not health — do not use it to judge status.
+
+Run with the global `--quiet` (`-q`) flag before the operation to drop `meta` and `operation` when you only need `summary`/`findings`/`data`.
+
 ## Commands
 
 ```text

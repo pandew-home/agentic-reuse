@@ -233,6 +233,7 @@ def execute(ctx, doc, supplied=None):
         ctx.truncated = ctx.truncated or result["meta"]["truncated"]
         ctx.omitted += result["meta"]["omitted"]
         ctx.dropped_bytes += result["meta"]["dropped_bytes"]
+        ctx.captured_bytes += result["meta"]["captured_bytes"]
     statuses = [x["status"] for x in results]
     status = "critical" if "critical" in statuses else "degraded" if any(x in ("degraded", "error") for x in statuses) else "unknown" if "unknown" in statuses else "healthy"
     findings = []

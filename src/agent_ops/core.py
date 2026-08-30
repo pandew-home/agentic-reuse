@@ -40,6 +40,7 @@ class Context:
     truncated: bool = False
     omitted: int = 0
     dropped_bytes: int = 0
+    captured_bytes: int = 0
     deadline: float | None = None
 
     def success(self, *, status="healthy", target=None, summary=None, findings=None, data=None):
@@ -105,6 +106,8 @@ def envelope(ctx, ok, status, target, summary, findings, data, error=None):
             "truncated": ctx.truncated,
             "omitted": ctx.omitted,
             "dropped_bytes": ctx.dropped_bytes,
+            "captured_bytes": ctx.captured_bytes,
+            "ingested_bytes": ctx.captured_bytes + ctx.dropped_bytes,
         },
     }
     if error is not None:
@@ -204,6 +207,7 @@ def run(ctx: Context, argv, timeout=20, input_text=None, allowed_codes=(0,), red
             proc.stdin.write(input_text.encode())
             proc.stdin.close()
         out, err = _read_bounded(ctx, proc, timeout)
+        ctx.captured_bytes += len(out) + len(err)
     except subprocess.TimeoutExpired:
         _stop_process_group(proc)
         raise OpsError("command_timeout", f"Diagnostic command exceeded {timeout}s", 5, {"executable": argv[0]})
@@ -237,5 +241,9 @@ def bounded(items, ctx: Context, limit=50):
     return values[:limit]
 
 
-def dump(result):
-    return json.dumps(sanitize(result), sort_keys=True, separators=(",", ":"))
+def dump(result, *, quiet=False):
+    if quiet:
+        result = {key: value for key, value in result.items() if key not in ("meta", "operation")}
+    if "meta" in result:
+        result["meta"]["envelope_bytes"] = len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return json.dumps(result, sort_keys=True, separators=(",", ":"))

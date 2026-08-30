@@ -21,6 +21,7 @@ class JsonArgumentParser(argparse.ArgumentParser):
 def _parser():
     parser = JsonArgumentParser(prog="agent-ops", description="Safe compact DevOps diagnostics")
     parser.add_argument("--version", action="version", version=f"agent-ops {__version__}")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Omit meta and operation from the JSON envelope")
     sub = parser.add_subparsers(dest="group", required=True)
     sub.add_parser("doctor")
     sub.add_parser("operations")
@@ -99,6 +100,7 @@ def _parse_params(values):
 def main(argv=None):
     parser = _parser()
     ctx = Context("cli")
+    quiet = False
     try:
         ns = parser.parse_args(argv)
     except OpsError as exc:
@@ -106,6 +108,7 @@ def main(argv=None):
         return exc.exit_code
     except SystemExit as exc:
         return exc.code
+    quiet = ns.quiet
     operation_name = ns.group if ns.group in ("doctor", "operations", "run") else f"{ns.group}.{ns.action}"
     ctx = Context(operation_name)
     try:
@@ -148,12 +151,12 @@ def main(argv=None):
         else:
             op = REGISTRY[operation_name]
             result = op.handler(ctx, _args(ns))
-        sys.stdout.write(dump(result) + "\n")
+        sys.stdout.write(dump(result, quiet=quiet) + "\n")
         return 0
     except OpsError as exc:
-        sys.stdout.write(dump(error_envelope(ctx, exc)) + "\n")
+        sys.stdout.write(dump(error_envelope(ctx, exc), quiet=quiet) + "\n")
         return exc.exit_code
     except Exception as exc:
         failure = OpsError("internal_error", "Unexpected diagnostic failure", 5, {"type": type(exc).__name__, "message": str(exc)})
-        sys.stdout.write(dump(error_envelope(ctx, failure)) + "\n")
+        sys.stdout.write(dump(error_envelope(ctx, failure), quiet=quiet) + "\n")
         return failure.exit_code

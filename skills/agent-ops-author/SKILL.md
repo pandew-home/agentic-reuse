@@ -30,7 +30,7 @@ Bound strings, bytes, lines, items, subprocess duration, and concurrency. Set `m
 
 Use `unittest` and fake executables prepended to `PATH`. Cover success, auth failure, timeout, malformed/noisy/oversized output, secrets, truncation, partial capability, omitted targets, unknown flags, and mutation rejection. Fixtures contain no credentials, kubeconfigs, production output, or auth files.
 
-Measure canonical compact JSON bytes and lines against bounded raw output. Require meaningful reduction or document deterministic-reasoning value.
+Use the runtime `meta` feedback to decide when reuse pays off. Every `agent-ops` call reports `captured_bytes`, `dropped_bytes`, `ingested_bytes`, and `envelope_bytes` in `meta`. A recurring diagnostic with high `ingested_bytes` against a small `envelope_bytes` is a candidate for a runbook (compose first) or a new registered operation. Do not fabricate savings; rely on these measured fields and the blocking tests below.
 
 Before exposing an operation, run:
 

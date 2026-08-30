@@ -63,6 +63,27 @@ agent-ops ci status --host gitlab.example.com --repo team/project --ref main
 
 Every completed invocation writes one compact JSON object. Read `ok`, `status`, `summary`, and `findings` first; inspect only relevant `data` branches when more evidence is needed.
 
+## When it pays off
+
+`agent-ops` trades a one-time bootstrap (install, skill load, learning the surface) for repeated savings. It is worth using when a diagnostic recurs or upstream output is large:
+
+- **Recurring checks** (health, status, TLS, CI) — runbooks amortize the cost after roughly two to three repeats.
+- **Verbose upstream output** — raw `kubectl`/`helm`/`argocd` dumps are bounded and reduced to `summary`/`findings`; worthwhile when raw output would exceed a few hundred lines.
+- **One-off, single commands** — the envelope and skill overhead can cost more than reading raw output once. Prefer plain tools.
+
+The envelope is byte-stable (`sort_keys`), so identical diagnostics diff cleanly across runs, which compounds the savings for repeated checks. Use the global `--quiet` (`-q`) flag before the operation name on high-frequency calls to drop the `meta` and `operation` fields when only `summary`/`findings`/`data` matter, e.g. `agent-ops --quiet k8s health --target ID --namespace NS`.
+
+## Self-measurement
+
+Every envelope reports real, measured `meta` (no estimates) so an agent can see the savings per call and decide when to refine the library:
+
+- `captured_bytes` — raw bytes read from upstream tools this call.
+- `dropped_bytes` — bytes discarded past the capture cap (`MAX_CAPTURE`).
+- `ingested_bytes` — `captured_bytes + dropped_bytes`, the total the tool absorbed.
+- `envelope_bytes` — size of the JSON actually returned.
+
+Compare `ingested_bytes` to `envelope_bytes` to gauge compression: a recurring diagnostic with high `ingested_bytes` against a small `envelope_bytes` is a candidate for a runbook (`agent-ops run NAME`) or a new registered operation. `meta` is accounting, not health — do not use it to judge `status`.
+
 ## Safety
 
 `agent-ops` is designed for bounded diagnostics, not general automation:
