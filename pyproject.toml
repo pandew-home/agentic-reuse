@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-reuse"
+version = "1.0.0"
+description = "Token-efficient, reusable diagnostics and constrained runbooks for coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Zane D"},
+  {name = "pandew-home"},
+]
+keywords = ["agents", "devops", "diagnostics", "runbooks", "token-optimization"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.scripts]
+agent-ops = "agent_ops.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/pandew-home/agentic-reuse#readme"
+Issues = "https://github.com/pandew-home/agentic-reuse/issues"
+Source = "https://github.com/pandew-home/agentic-reuse"
+
+[tool.setuptools.packages.find]
+where = ["src"]

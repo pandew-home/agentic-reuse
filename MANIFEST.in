@@ -1,0 +1,6 @@
+include CONTRIBUTING.md
+include LICENSE
+include README.md
+include SECURITY.md
+include install-skills.sh
+recursive-include skills *.md
