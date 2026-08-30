@@ -100,6 +100,12 @@ class AgentOpsTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual("invalid_target", result["error"]["code"])
 
+    def test_required_target_arguments_use_exit_three(self):
+        for argv in (["k8s", "logs"], ["helm", "check"], ["ci", "failures"], ["network", "http"]):
+            code, result = self.call_cli(argv)
+            self.assertEqual(3, code, argv)
+            self.assertEqual("invalid_target", result["error"]["code"], argv)
+
     def test_argv_like_resource_name_is_rejected(self):
         with self.assertRaises(OpsError) as caught:
             operations.container_status(Context("container.status"), {"engine": "docker", "name": "--all"})
@@ -205,6 +211,12 @@ class AgentOpsTest(unittest.TestCase):
         self.assertNotIn("never-real", encoded)
         self.assertEqual("healthy", result["status"])
 
+    def test_starting_container_is_degraded(self):
+        obj = [{"Name": "/web", "Config": {"Image": "example/web:1"}, "State": {"Status": "running", "Running": True, "ExitCode": 0, "Health": {"Status": "starting"}}, "RestartCount": 0, "NetworkSettings": {"Ports": {}}}]
+        with mock.patch("agent_ops.operations.run_json", return_value=obj):
+            result = operations.container_status(Context("container.status"), {"engine": "docker", "name": "web"})
+        self.assertEqual("degraded", result["status"])
+
     def test_ci_always_passes_explicit_host_and_encoded_repo(self):
         result = operations.ci_status(Context("ci.status"), {"host": "git.example", "repo": "team/project", "ref": "main"})
         self.assertEqual("git.example", result["target"]["host"])
@@ -241,6 +253,11 @@ class AgentOpsTest(unittest.TestCase):
             with self.assertRaises(OpsError):
                 validate(doc)
 
+    def test_runbook_rejects_non_boolean_fail_fast(self):
+        doc = {"schema": "agent-ops/runbook-v1", "name": "demo", "fail_fast": "false", "steps": [{"id": "one", "operation": "network.dns", "args": {"host": "example.test"}}]}
+        with self.assertRaises(OpsError):
+            validate(doc)
+
     def test_runbook_substitution_is_whole_value_only(self):
         doc = {"schema": "agent-ops/runbook-v1", "name": "demo", "parameters": {"host": "example.test"}, "steps": [{"id": "one", "operation": "network.dns", "args": {"host": "https://${host}"}}]}
         with self.assertRaises(OpsError):
@@ -264,6 +281,16 @@ class AgentOpsTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.3)
         self.assertEqual(["one", "two", "three", "four"], [step["id"] for step in result["data"]["steps"]])
         self.assertNotIn("data", result["data"]["steps"][0])
+
+    def test_runbook_aggregates_step_findings(self):
+        def degraded(ctx, args):
+            return ctx.success(status="degraded", findings=[{"severity": "warning", "code": "diagnostic_warning", "message": "warning", "resource": "service", "evidence": {}}])
+        operation = Operation("test.degraded", degraded, (), (), (), True, "none", 20)
+        doc = {"schema": "agent-ops/runbook-v1", "name": "demo", "steps": [{"id": "check", "operation": "test.degraded", "args": {}}]}
+        with mock.patch.dict(REGISTRY, {"test.degraded": operation}):
+            result = execute(Context("run"), doc)
+        self.assertEqual("diagnostic_warning", result["findings"][0]["code"])
+        self.assertEqual("check:service", result["findings"][0]["resource"])
 
     def test_optional_metrics_do_not_degrade_healthy_cluster(self):
         documents = iter([{"items": []}] * 5)
@@ -292,6 +319,12 @@ class AgentOpsTest(unittest.TestCase):
         self.assertEqual("critical", result["status"])
         self.assertEqual("job_failed", result["findings"][0]["code"])
 
+    def test_malformed_kubernetes_list_is_rejected(self):
+        with self.assertRaises(OpsError) as caught:
+            operations._items({})
+        self.assertEqual("malformed_output", caught.exception.code)
+        self.assertEqual(6, caught.exception.exit_code)
+
     def test_eks_identity_change_forces_refresh(self):
         target = {"id": "demo", "aws_profile": "new-profile", "aws_region": "us-east-1", "eks_cluster": "new-cluster"}
         cached = {"stale": False, "aws_profile": "old-profile", "aws_region": "us-east-1", "eks_cluster": "old-cluster"}
@@ -313,6 +346,20 @@ class AgentOpsTest(unittest.TestCase):
             result = operations.gitops_multicluster(Context("gitops.multicluster"), {"targets": [{"id": "demo"}]})
         self.assertEqual("degraded", result["status"])
         self.assertEqual(1, result["summary"]["degraded"])
+
+    def test_multicluster_aggregates_target_and_app_findings(self):
+        target_finding = {"severity": "warning", "code": "k8s_warning", "message": "warning", "resource": "pod", "evidence": {}}
+        app_finding = {"severity": "critical", "code": "argo_failure", "message": "failure", "resource": "deployment", "evidence": {}}
+        child = {"id": "demo", "ok": True, "status": "critical", "commands_run": 1, "truncated": False, "omitted": 0, "dropped_bytes": 0, "kubernetes": {}, "apps": [{"app": "platform", "status": "critical", "summary": {}, "findings": [app_finding], "data": {}}], "findings": [target_finding]}
+        with mock.patch("agent_ops.operations._gitops_target", side_effect=lambda *args: dict(child)):
+            result = operations.gitops_multicluster(Context("gitops.multicluster"), {"targets": [{"id": "demo"}]})
+        self.assertEqual({"k8s_warning", "argo_failure"}, {item["code"] for item in result["findings"]})
+
+    def test_argo_diff_parses_real_headers_and_omits_secrets(self):
+        output = "===== apps/Deployment default/web =====\n-difference\n===== /Secret default/credentials =====\n-difference\n"
+        with mock.patch("agent_ops.operations.run", return_value=(output, "", 1)):
+            result = operations.argo_diff(Context("argo.diff"), {"argocd_context": "central", "app": "demo"})
+        self.assertEqual([{"group": "apps", "kind": "Deployment", "namespace": "default", "name": "web"}], result["data"]["resources"])
 
     def test_multicluster_step_can_precede_another_runbook_step(self):
         target = {"id": "prod", "argocd_context": "central", "apps": ["platform"], "aws_profile": "kion-prod", "aws_region": "us-east-1", "eks_cluster": "prod-use1", "namespace": "platform"}

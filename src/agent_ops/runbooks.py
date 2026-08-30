@@ -5,6 +5,7 @@ import pathlib
 import re
 
 from .core import Context, OpsError, SECRET_KEY_RE, error_envelope
+from . import operations as _operations  # Register built-in operations for direct module use.
 from .registry import REGISTRY
 
 SCHEMA = "agent-ops/runbook-v1"
@@ -82,6 +83,8 @@ def validate(doc):
     concurrency = doc.get("concurrency", 1)
     if not isinstance(concurrency, int) or not 1 <= concurrency <= 4:
         raise OpsError("invalid_runbook", "Runbook concurrency must be 1-4", 2)
+    if not isinstance(doc.get("fail_fast", False), bool):
+        raise OpsError("invalid_runbook", "Runbook fail_fast must be boolean", 2)
     parameters = doc.get("parameters", {})
     if not isinstance(parameters, dict) or any(not NAME_RE.fullmatch(str(k)) for k in parameters):
         raise OpsError("invalid_runbook", "Runbook parameters must be named scalar defaults", 2)
@@ -232,4 +235,10 @@ def execute(ctx, doc, supplied=None):
         ctx.dropped_bytes += result["meta"]["dropped_bytes"]
     statuses = [x["status"] for x in results]
     status = "critical" if "critical" in statuses else "degraded" if any(x in ("degraded", "error") for x in statuses) else "unknown" if "unknown" in statuses else "healthy"
-    return ctx.success(status=status, target={"runbook": doc["name"]}, summary={"steps": len(results), "failed": sum(not x["ok"] for x in results)}, data={"steps": results})
+    findings = []
+    for result in results:
+        for item in result.get("findings", []):
+            findings.append({**item, "resource": f"{result['id']}:{item.get('resource', '')}".rstrip(":")})
+        if not result["ok"]:
+            findings.append({"severity": "critical", "code": "runbook_step_failed", "message": result.get("error", {}).get("message", "Runbook step failed"), "resource": result["id"], "evidence": {"error_code": result.get("error", {}).get("code")}})
+    return ctx.success(status=status, target={"runbook": doc["name"]}, summary={"steps": len(results), "failed": sum(not x["ok"] for x in results)}, findings=findings[:50], data={"steps": results})

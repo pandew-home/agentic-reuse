@@ -13,7 +13,7 @@ from .runbooks import discover, execute, load_file, resolve
 
 class JsonArgumentParser(argparse.ArgumentParser):
     def error(self, message):
-        target_flags = ("--target", "--namespace", "--argocd-context", "--app", "--host", "--repo", "--unit", "--engine", "--name")
+        target_flags = ("--target", "--namespace", "--argocd-context", "--app", "--host", "--repo", "--unit", "--engine", "--name", "--pod", "--chart", "--cluster", "--url", "--pipeline", "--file", "--project", "--region", "--aws-profile")
         target_error = "required" in message and any(flag in message for flag in target_flags)
         raise OpsError("invalid_target" if target_error else "invalid_arguments", message, 3 if target_error else 2)
 

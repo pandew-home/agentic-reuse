@@ -167,7 +167,9 @@ def _kubectl_json(ctx, path, target, resource, namespace=None, extra=None):
 
 
 def _items(doc):
-    return doc.get("items", []) if isinstance(doc, dict) else []
+    if not isinstance(doc, dict) or not isinstance(doc.get("items"), list):
+        raise OpsError("malformed_output", "Kubernetes response did not contain an items list", 6)
+    return doc["items"]
 
 
 @operation("k8s.health", required=("target", "namespace"), executables=("kubectl",), runbook=True, timeout=45)
@@ -352,10 +354,12 @@ def argo_diff(ctx, args):
     app_name = _safe_value(args.get("app"), "Argo CD application")
     output, _, code = run(ctx, ["argocd", "--argocd-context", context, "app", "diff", app_name], allowed_codes=(0, 1))
     resources = []
-    for match in re.finditer(r"(?m)^=====\s+([^/\s]+)/([^/\s]+)/([^\s]+)", output):
-        group, kind, name = match.groups()
+    for match in re.finditer(r"(?m)^=====\s+([^\s]+)\s+([^\s]+)(?:\s+=====)?$", output):
+        resource_type, identity = match.groups()
+        group, _, kind = resource_type.rpartition("/")
+        namespace, _, name = identity.rpartition("/")
         if kind.lower() != "secret":
-            resources.append({"group": group, "kind": kind, "name": name})
+            resources.append({"group": group, "kind": kind, "namespace": namespace, "name": name})
     resources = bounded(resources, ctx, 50)
     return ctx.success(status="degraded" if code else "healthy", target={"argocd_context": context, "app": app_name}, summary={"different": bool(code), "resources": len(resources)}, findings=[finding("warning", "argo_diff", "Application has differences", app_name)] if code else [], data={"resources": resources})
 
@@ -430,6 +434,13 @@ def gitops_multicluster(ctx, args):
     degraded = sum(x["status"] == "degraded" for x in results)
     status = "critical" if critical else "degraded" if failed or degraded else "healthy"
     findings = [finding("critical", "target_failed", "Target diagnostic failed", x.get("id"), x.get("error", {})) for x in results if not x["ok"]]
+    for result in results:
+        for item in result.get("findings", []):
+            findings.append({**item, "resource": f"{result.get('id')}:{item.get('resource', '')}".rstrip(":")})
+        for app in result.get("apps", []):
+            for item in app.get("findings", []):
+                findings.append({**item, "resource": f"{result.get('id')}:{app.get('app')}:{item.get('resource', '')}".rstrip(":")})
+    findings = bounded(findings, ctx, 50)
     return ctx.success(status=status, target={"target_ids": ids}, summary={"targets": len(results), "healthy": sum(x["status"] == "healthy" for x in results), "degraded": degraded, "critical": critical, "failed": failed}, findings=findings, data={"targets": results})
 
 
@@ -502,8 +513,10 @@ def container_status(ctx, args):
     obj = rows[0] if isinstance(rows, list) and rows else rows
     state = obj.get("State", {})
     data = {"name": obj.get("Name", name).lstrip("/"), "image": obj.get("Config", {}).get("Image"), "status": state.get("Status"), "running": state.get("Running"), "exit_code": state.get("ExitCode"), "restart_count": obj.get("RestartCount", 0), "health": state.get("Health", {}).get("Status"), "ports": sorted((obj.get("NetworkSettings", {}).get("Ports") or {}).keys())}
-    healthy = data["running"] and data["health"] not in ("unhealthy",)
-    return ctx.success(status="healthy" if healthy else "critical", target={"engine": engine, "name": name}, summary=data, findings=[] if healthy else [finding("critical", "container_unhealthy", "Container is not healthy and running", name, data)])
+    health = data["health"]
+    healthy = data["running"] and health in (None, "", "healthy")
+    status = "degraded" if data["running"] and health == "starting" else "healthy" if healthy else "critical"
+    return ctx.success(status=status, target={"engine": engine, "name": name}, summary=data, findings=[] if healthy else [finding("warning" if status == "degraded" else "critical", "container_unhealthy", "Container is not healthy and running", name, data)])
 
 
 @operation("container.logs", required=("engine", "name"), allowed=("lines",), executables=("docker|podman",))
