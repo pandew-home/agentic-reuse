@@ -371,6 +371,23 @@ class AgentOpsTest(unittest.TestCase):
             result = operations.container_logs(Context("container.logs"), {"engine": "docker", "name": "web", "lines": 10})
         self.assertEqual(["normal output", "error output"], result["data"]["lines"])
 
+    def test_container_logs_tail_long_stderr_and_report_omissions(self):
+        errors = "\n".join(f"error-{index:04d}-" + "x" * 40 for index in range(100))
+        with mock.patch("agent_ops.operations.run", return_value=("", errors, 0)):
+            result = operations.container_logs(Context("container.logs"), {"engine": "docker", "name": "web", "lines": 5})
+        self.assertEqual([f"error-{index:04d}-" + "x" * 40 for index in range(95, 100)], result["data"]["lines"])
+        self.assertTrue(result["meta"]["truncated"])
+        self.assertEqual(95, result["meta"]["omitted"])
+
+    def test_runner_preserves_redacted_stderr_beyond_two_kilobytes(self):
+        errors = "prefix " + "x" * 3000 + " token=synthetic-secret"
+        script = self.bin / "fake-stderr"
+        script.write_text("#!/usr/bin/env python3\nimport sys\nsys.stderr.write(" + repr(errors) + ")\n")
+        script.chmod(0o755)
+        _, stderr, _ = run(Context("test"), ["fake-stderr"])
+        self.assertGreater(len(stderr), 2000)
+        self.assertNotIn("synthetic-secret", stderr)
+
     def test_compose_check_includes_stopped_services(self):
         compose_file = self.root / "compose.yaml"
         compose_file.write_text("services: {}\n")

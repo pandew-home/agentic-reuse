@@ -524,7 +524,11 @@ def container_logs(ctx, args):
     engine, name = _engine(args), _safe_value(args.get("name"), "Container name")
     lines = min(max(int(args.get("lines", 50)), 1), 200)
     output, errors, _ = run(ctx, [engine, "logs", "--tail", str(lines), name])
-    rows = (output + ("\n" if output and errors else "") + errors).splitlines()[-lines:]
+    all_rows = (output + ("\n" if output and errors else "") + errors).splitlines()
+    if len(all_rows) > lines:
+        ctx.truncated = True
+        ctx.omitted += len(all_rows) - lines
+    rows = all_rows[-lines:]
     return ctx.success(status="unknown", target={"engine": engine, "name": name}, summary={"lines": len(rows)}, data={"lines": rows})
 
 

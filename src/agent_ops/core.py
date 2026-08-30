@@ -214,7 +214,7 @@ def run(ctx: Context, argv, timeout=20, input_text=None, allowed_codes=(0,), red
     stdout = out.decode("utf-8", "replace")
     if redact_stdout:
         stdout = redact_text(stdout, None)
-    stderr = redact_text(err.decode("utf-8", "replace"))
+    stderr = redact_text(err.decode("utf-8", "replace"), None)
     if proc.returncode not in allowed_codes:
         code = "authentication_failed" if re.search(r"(?i)(authorization|unauthorized|forbidden|credential|login|authentication|access denied)", stderr) else "command_failed"
         raise OpsError(code, stderr.strip() or f"{argv[0]} exited with {proc.returncode}", 4 if code == "authentication_failed" else 5, {"exit_code": proc.returncode, "executable": argv[0]})
