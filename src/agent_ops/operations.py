@@ -135,7 +135,7 @@ def eks_refresh(ctx, args):
             run(ctx, ["aws", "--profile", profile, "--region", region, "eks", "update-kubeconfig", "--name", cluster, "--kubeconfig", temp_name, "--alias", target, "--user-alias", target], timeout=60)
             text = pathlib.Path(temp_name).read_text(errors="replace")
             aliases = re.findall(rf"(?m)^\s*-?\s*name:\s*{re.escape(target)}\s*$", text)
-            if len(text) > 1_000_000 or len(aliases) < 3 or not re.search(rf"(?m)^current-context:\s*{re.escape(target)}\s*$", text):
+            if len(text) > 1_000_000 or len(aliases) < 2 or not re.search(rf"(?m)^current-context:\s*{re.escape(target)}\s*$", text):
                 raise OpsError("invalid_kubeconfig", "Generated kubeconfig did not contain the expected target alias", 6)
             os.replace(temp_name, _kube_path(target))
             os.chmod(_kube_path(target), 0o600)
@@ -216,9 +216,9 @@ def k8s_health(ctx, args):
         findings.append(finding("warning", "warning_events", f"{len(event_rows)} recent warning events", namespace))
     metrics = {}
     try:
-        node_metrics = run_json(ctx, ["kubectl", "--kubeconfig", str(path), "--context", target, "top", "nodes", "-o", "json"])
-        pod_metrics = run_json(ctx, ["kubectl", "--kubeconfig", str(path), "--context", target, "top", "pods", "--namespace", namespace, "-o", "json"])
-        metrics = {"nodes": len(_items(node_metrics)), "pods": len(_items(pod_metrics))}
+        node_metrics, _, _ = run(ctx, ["kubectl", "--kubeconfig", str(path), "--context", target, "top", "nodes", "--no-headers"])
+        pod_metrics, _, _ = run(ctx, ["kubectl", "--kubeconfig", str(path), "--context", target, "top", "pods", "--namespace", namespace, "--no-headers"])
+        metrics = {"nodes": len([line for line in node_metrics.splitlines() if line.strip()]), "pods": len([line for line in pod_metrics.splitlines() if line.strip()])}
     except OpsError as exc:
         findings.append(finding("info", "metrics_unavailable", "Resource metrics are unavailable", target, {"reason": exc.code}))
     status = "critical" if any(x["severity"] == "critical" for x in findings) else "degraded" if any(x["severity"] == "warning" for x in findings) else "healthy"
@@ -427,9 +427,10 @@ def gitops_multicluster(ctx, args):
     ctx.dropped_bytes += sum(x.pop("dropped_bytes", 0) for x in results)
     failed = sum(not x["ok"] for x in results)
     critical = sum(x["status"] == "critical" for x in results)
-    status = "critical" if critical else "degraded" if failed else "healthy"
+    degraded = sum(x["status"] == "degraded" for x in results)
+    status = "critical" if critical else "degraded" if failed or degraded else "healthy"
     findings = [finding("critical", "target_failed", "Target diagnostic failed", x.get("id"), x.get("error", {})) for x in results if not x["ok"]]
-    return ctx.success(status=status, target={"target_ids": ids}, summary={"targets": len(results), "healthy": sum(x["status"] == "healthy" for x in results), "critical": critical, "failed": failed}, findings=findings, data={"targets": results})
+    return ctx.success(status=status, target={"target_ids": ids}, summary={"targets": len(results), "healthy": sum(x["status"] == "healthy" for x in results), "degraded": degraded, "critical": critical, "failed": failed}, findings=findings, data={"targets": results})
 
 
 def _chart(args):
@@ -509,8 +510,8 @@ def container_status(ctx, args):
 def container_logs(ctx, args):
     engine, name = _engine(args), _safe_value(args.get("name"), "Container name")
     lines = min(max(int(args.get("lines", 50)), 1), 200)
-    output, _, _ = run(ctx, [engine, "logs", "--tail", str(lines), name])
-    rows = output.splitlines()[-lines:]
+    output, errors, _ = run(ctx, [engine, "logs", "--tail", str(lines), name])
+    rows = (output + ("\n" if output and errors else "") + errors).splitlines()[-lines:]
     return ctx.success(status="unknown", target={"engine": engine, "name": name}, summary={"lines": len(rows)}, data={"lines": rows})
 
 
@@ -521,7 +522,7 @@ def compose_check(ctx, args):
         raise OpsError("invalid_target", "Explicit local Compose file and project are required", 3)
     base = [engine, "compose", "--file", str(file), "--project-name", project]
     run(ctx, base + ["config", "--quiet"])
-    output, _, _ = run(ctx, base + ["ps", "--format", "json"])
+    output, _, _ = run(ctx, base + ["ps", "--all", "--format", "json"])
     try:
         parsed = json.loads(output)
         rows = parsed if isinstance(parsed, list) else [parsed]

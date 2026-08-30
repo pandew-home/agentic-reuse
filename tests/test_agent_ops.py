@@ -43,7 +43,7 @@ elif name == "aws":
     path = sys.argv[sys.argv.index("--kubeconfig") + 1]
     alias = sys.argv[sys.argv.index("--alias") + 1]
     with open(path, "w") as f:
-        f.write("apiVersion: v1\nclusters:\n- name: %s\ncontexts:\n- name: %s\nusers:\n- name: %s\ncurrent-context: %s\n" % (alias, alias, alias, alias))
+        f.write("apiVersion: v1\nclusters:\n- name: arn:aws:eks:us-east-1:123456789012:cluster/prod-use1\ncontexts:\n- name: %s\nusers:\n- name: %s\ncurrent-context: %s\n" % (alias, alias, alias))
     print("updated")
 elif name == "kubectl":
     if "current-context" in sys.argv:
@@ -267,10 +267,22 @@ class AgentOpsTest(unittest.TestCase):
 
     def test_optional_metrics_do_not_degrade_healthy_cluster(self):
         documents = iter([{"items": []}] * 5)
-        with mock.patch("agent_ops.operations.ensure_target", return_value=("demo", pathlib.Path("/tmp/demo"))), mock.patch("agent_ops.operations._kubectl_json", side_effect=lambda *args, **kwargs: next(documents)), mock.patch("agent_ops.operations.run_json", side_effect=OpsError("command_failed", "metrics unavailable")):
+        with mock.patch("agent_ops.operations.ensure_target", return_value=("demo", pathlib.Path("/tmp/demo"))), mock.patch("agent_ops.operations._kubectl_json", side_effect=lambda *args, **kwargs: next(documents)), mock.patch("agent_ops.operations.run", side_effect=OpsError("command_failed", "metrics unavailable")):
             result = operations.k8s_health(Context("k8s.health"), {"target": "demo", "namespace": "platform"})
         self.assertEqual("healthy", result["status"])
         self.assertEqual("info", result["findings"][0]["severity"])
+
+    def test_kubernetes_metrics_use_supported_table_output(self):
+        documents = iter([{"items": []}] * 5)
+        metric_calls = []
+        def fake_run(ctx, argv, **kwargs):
+            metric_calls.append(argv)
+            return "node-a 100m 10% 1Gi 20%\n", "", 0
+        with mock.patch("agent_ops.operations.ensure_target", return_value=("demo", pathlib.Path("/tmp/demo"))), mock.patch("agent_ops.operations._kubectl_json", side_effect=lambda *args, **kwargs: next(documents)), mock.patch("agent_ops.operations.run", side_effect=fake_run):
+            result = operations.k8s_health(Context("k8s.health"), {"target": "demo", "namespace": "platform"})
+        self.assertEqual({"nodes": 1, "pods": 1}, result["summary"]["metrics"])
+        self.assertTrue(all("--no-headers" in argv for argv in metric_calls))
+        self.assertTrue(all("-o" not in argv for argv in metric_calls))
 
     def test_failed_job_is_critical(self):
         job = {"metadata": {"name": "batch"}, "spec": {}, "status": {"failed": 1, "conditions": [{"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}]}}
@@ -294,6 +306,36 @@ class AgentOpsTest(unittest.TestCase):
         self.assertTrue(result["meta"]["truncated"])
         self.assertEqual(7, result["meta"]["omitted"])
         self.assertEqual(99, result["meta"]["dropped_bytes"])
+
+    def test_multicluster_preserves_degraded_status(self):
+        child = {"id": "demo", "ok": True, "status": "degraded", "commands_run": 1, "truncated": False, "omitted": 0, "dropped_bytes": 0, "kubernetes": {}, "apps": [], "findings": []}
+        with mock.patch("agent_ops.operations._gitops_target", side_effect=lambda *args: dict(child)):
+            result = operations.gitops_multicluster(Context("gitops.multicluster"), {"targets": [{"id": "demo"}]})
+        self.assertEqual("degraded", result["status"])
+        self.assertEqual(1, result["summary"]["degraded"])
+
+    def test_multicluster_step_can_precede_another_runbook_step(self):
+        target = {"id": "prod", "argocd_context": "central", "apps": ["platform"], "aws_profile": "kion-prod", "aws_region": "us-east-1", "eks_cluster": "prod-use1", "namespace": "platform"}
+        doc = {"schema": "agent-ops/runbook-v1", "name": "demo", "steps": [{"id": "fleet", "operation": "gitops.multicluster", "args": {"targets": [target]}}, {"id": "dns", "operation": "network.dns", "args": {"host": "example.test"}}]}
+        self.assertIs(validate(doc), doc)
+
+    def test_container_logs_include_stderr(self):
+        with mock.patch("agent_ops.operations.run", return_value=("normal output", "error output", 0)):
+            result = operations.container_logs(Context("container.logs"), {"engine": "docker", "name": "web", "lines": 10})
+        self.assertEqual(["normal output", "error output"], result["data"]["lines"])
+
+    def test_compose_check_includes_stopped_services(self):
+        compose_file = self.root / "compose.yaml"
+        compose_file.write_text("services: {}\n")
+        stopped = json.dumps([{"Name": "web", "Service": "web", "State": "exited", "Health": "", "ExitCode": 1}])
+        calls = []
+        def fake_run(ctx, argv, **kwargs):
+            calls.append(argv)
+            return (stopped, "", 0) if "ps" in argv else ("", "", 0)
+        with mock.patch("agent_ops.operations.run", side_effect=fake_run):
+            result = operations.compose_check(Context("compose.check"), {"engine": "docker", "file": str(compose_file), "project": "demo"})
+        self.assertIn("--all", calls[1])
+        self.assertEqual("critical", result["status"])
 
     def test_http_rejects_private_targets(self):
         with mock.patch("agent_ops.operations.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("169.254.169.254", 0))]):

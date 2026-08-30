@@ -122,7 +122,7 @@ def validate(doc):
             targets = args.get("targets")
             if not isinstance(targets, list) or not 1 <= len(targets) <= 20:
                 raise OpsError("invalid_runbook", "Multicluster steps require 1-20 targets", 2)
-            ids = []
+            target_ids = []
             required_target = {"id", "argocd_context", "apps", "aws_profile", "aws_region", "eks_cluster", "namespace"}
             for target in targets:
                 if not isinstance(target, dict) or set(target) != required_target:
@@ -131,8 +131,8 @@ def validate(doc):
                     raise OpsError("invalid_runbook", "Multicluster target identity fields must be non-empty strings", 2)
                 if not isinstance(target["apps"], list) or not 1 <= len(target["apps"]) <= 20 or not all(isinstance(app, str) and app for app in target["apps"]):
                     raise OpsError("invalid_runbook", "Each multicluster target requires 1-20 application names", 2)
-                ids.append(target["id"])
-            if len(ids) != len(set(ids)):
+                target_ids.append(target["id"])
+            if len(target_ids) != len(set(target_ids)):
                 raise OpsError("invalid_runbook", "Multicluster target IDs must be unique", 2)
     return doc
 
