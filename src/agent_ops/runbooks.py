@@ -1,18 +1,25 @@
+import concurrent.futures
 import json
 import os
 import pathlib
 import re
 
-from .core import Context, OpsError
+from .core import Context, OpsError, SECRET_KEY_RE, error_envelope
 from .registry import REGISTRY
 
 SCHEMA = "agent-ops/runbook-v1"
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 SUB_RE = re.compile(r"^\$\{([a-z][a-z0-9_]*)\}$")
-SECRET_RE = re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)")
 INTEGER_ARGS = {"lines", "limit", "port", "concurrency"}
 BOOLEAN_ARGS = {"previous", "fail_fast"}
 LIST_ARGS = {"values", "targets"}
+CHOICES = {
+    ("network.dns", "type"): {"A", "AAAA", "CNAME", "MX", "TXT"},
+    ("network.http", "method"): {"HEAD", "GET"},
+    ("container.status", "engine"): {"docker", "podman"},
+    ("container.logs", "engine"): {"docker", "podman"},
+    ("compose.check", "engine"): {"docker", "podman"},
+}
 
 
 def _project_root(start=None):
@@ -44,7 +51,7 @@ def discover(scope="all"):
 def _no_secrets(value, path=""):
     if isinstance(value, dict):
         for key, child in value.items():
-            if SECRET_RE.search(str(key)):
+            if SECRET_KEY_RE.search(str(key)):
                 raise OpsError("unsafe_runbook", f"Secret-like field is not allowed: {path}{key}", 3)
             _no_secrets(child, f"{path}{key}.")
     elif isinstance(value, list):
@@ -107,6 +114,9 @@ def validate(doc):
                 raise OpsError("invalid_runbook", f"Step {step['id']} argument {key} must be a list", 2)
             if key not in INTEGER_ARGS | BOOLEAN_ARGS | LIST_ARGS and not isinstance(value, (str, int)):
                 raise OpsError("invalid_runbook", f"Step {step['id']} argument {key} must be scalar", 2)
+            choices = CHOICES.get((name, key))
+            if choices and not (isinstance(value, str) and SUB_RE.fullmatch(value)) and value not in choices:
+                raise OpsError("invalid_runbook", f"Step {step['id']} argument {key} is unsupported", 2)
         _validate_substitutions(args, parameters)
         if name == "gitops.multicluster":
             targets = args.get("targets")
@@ -153,13 +163,48 @@ def substitute(value, parameters):
     return value
 
 
-def resolve(name):
+def resolve(name, scope=None):
     if not NAME_RE.fullmatch(name):
         raise OpsError("invalid_runbook", "Runbook name is invalid", 2)
-    matches = {x["name"]: x for x in discover("all")}
+    if scope == "project":
+        matches = {x["name"]: x for x in discover("project")}
+    elif scope == "user":
+        matches = {x["name"]: x for x in discover("user")}
+    else:
+        user_matches = {x["name"]: x for x in discover("user")}
+        project_matches = {x["name"]: x for x in discover("project")}
+        if name in project_matches and name not in user_matches:
+            raise OpsError("project_scope_required", "Project runbooks require --scope project", 3)
+        matches = user_matches
     if name not in matches:
         raise OpsError("runbook_not_found", f"Runbook not found: {name}", 2)
     return matches[name]
+
+
+def _run_step(step, parameters, deadline):
+    operation = REGISTRY[step["operation"]]
+    local = Context(operation.name, deadline=deadline)
+    args = substitute(step["args"], parameters)
+    validate({"schema": SCHEMA, "name": "resolved-step", "steps": [{"id": step["id"], "operation": step["operation"], "args": args}]})
+    try:
+        result = operation.handler(local, args)
+    except OpsError as exc:
+        result = error_envelope(local, exc)
+    compact = {
+        "id": step["id"],
+        "operation": result["operation"],
+        "ok": result["ok"],
+        "status": result["status"],
+        "target": result["target"],
+        "summary": result["summary"],
+        "meta": result["meta"],
+    }
+    if result["status"] != "healthy" or not result["ok"]:
+        compact["findings"] = result["findings"]
+        compact["data"] = result["data"]
+        if "error" in result:
+            compact["error"] = result["error"]
+    return compact
 
 
 def execute(ctx, doc, supplied=None):
@@ -169,21 +214,22 @@ def execute(ctx, doc, supplied=None):
         if key not in parameters:
             raise OpsError("invalid_parameter", f"Unknown runbook parameter: {key}", 2)
         parameters[key] = value
-    results = []
-    for step in doc["steps"]:
-        operation = REGISTRY[step["operation"]]
-        local = Context(operation.name)
-        args = substitute(step["args"], parameters)
-        try:
-            result = operation.handler(local, args)
-        except OpsError as exc:
-            result = {"schema": "agent-ops/v1", "ok": False, "status": "error", "operation": operation.name, "target": {}, "summary": {}, "findings": [], "data": {}, "meta": {"duration_ms": 0, "commands_run": local.commands_run, "truncated": local.truncated, "omitted": local.omitted}, "error": {"code": exc.code, "message": exc.message, "details": exc.details or {}}}
-        results.append({"id": step["id"], "result": result})
+    if doc.get("fail_fast", False):
+        results = []
+        for step in doc["steps"]:
+            result = _run_step(step, parameters, ctx.deadline)
+            results.append(result)
+            if not result["ok"]:
+                break
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=doc.get("concurrency", 1)) as pool:
+            futures = [pool.submit(_run_step, step, parameters, ctx.deadline) for step in doc["steps"]]
+            results = [future.result() for future in futures]
+    for result in results:
         ctx.commands_run += result["meta"]["commands_run"]
         ctx.truncated = ctx.truncated or result["meta"]["truncated"]
         ctx.omitted += result["meta"]["omitted"]
-        if not result["ok"] and doc.get("fail_fast", False):
-            break
-    statuses = [x["result"]["status"] for x in results]
+        ctx.dropped_bytes += result["meta"]["dropped_bytes"]
+    statuses = [x["status"] for x in results]
     status = "critical" if "critical" in statuses else "degraded" if any(x in ("degraded", "error") for x in statuses) else "unknown" if "unknown" in statuses else "healthy"
-    return ctx.success(status=status, target={"runbook": doc["name"]}, summary={"steps": len(results), "failed": sum(not x["result"]["ok"] for x in results)}, data={"steps": results})
+    return ctx.success(status=status, target={"runbook": doc["name"]}, summary={"steps": len(results), "failed": sum(not x["ok"] for x in results)}, data={"steps": results})

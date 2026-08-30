@@ -66,7 +66,7 @@ def _parser():
     runbook = sub.add_parser("runbook").add_subparsers(dest="action", required=True)
     p = runbook.add_parser("list"); p.add_argument("--scope", choices=("user", "project", "all"), default="all")
     p = runbook.add_parser("validate"); p.add_argument("--file", required=True)
-    p = sub.add_parser("run"); p.add_argument("name"); p.add_argument("--param", action="append", default=[])
+    p = sub.add_parser("run"); p.add_argument("name"); p.add_argument("--scope", choices=("user", "project")); p.add_argument("--param", action="append", default=[])
     return parser
 
 
@@ -77,7 +77,7 @@ def _target(parser):
 def _args(namespace):
     values = vars(namespace).copy()
     values.pop("group", None); values.pop("action", None)
-    return {key.replace("_", "-") if False else key: value for key, value in values.items()}
+    return values
 
 
 def _parse_params(values):
@@ -141,7 +141,7 @@ def main(argv=None):
             doc = load_file(ns.file)
             result = ctx.success(summary={"valid": True, "name": doc["name"], "steps": len(doc["steps"])}, target={"file": os.path.abspath(os.path.expanduser(ns.file))})
         elif ns.group == "run":
-            source = resolve(ns.name)
+            source = resolve(ns.name, ns.scope)
             doc = load_file(source["path"])
             result = execute(ctx, doc, _parse_params(ns.param))
             result["target"].update({"scope": source["scope"], "source": source["path"]})

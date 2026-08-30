@@ -6,24 +6,38 @@ The package focuses on spending reasoning tokens once. Agents can invoke a stabl
 
 ## Installation
 
-Install the isolated CLI with pipx:
+### Agent Bootstrap
+
+An agent that needs both the command and reusable skills should clone the canonical repository, install the package editable, install the skills, and verify both layers:
 
 ```bash
-pipx install agentic-reuse
+git clone https://github.com/pandew-home/agentic-reuse.git
+cd agentic-reuse
+pipx install --editable .
+./install-skills.sh
 agent-ops --version
+agent-ops operations
+test -f ~/.agents/skills/agent-ops/SKILL.md
+test -f ~/.agents/skills/agent-ops-author/SKILL.md
+test -f ~/.claude/skills/agent-ops/SKILL.md
+test -f ~/.claude/skills/agent-ops-author/SKILL.md
 ```
 
-Or install it with pip:
+The editable install keeps the `agent-ops` command connected to the checkout used by `agent-ops-author`. Restart the agent client after installing skills so Kilo, Grok, Claude, and compatible clients rescan their skill directories.
+
+For an isolated CLI-only installation, use pipx from the GitHub repository:
 
 ```bash
-python3 -m pip install agentic-reuse
+pipx install git+https://github.com/pandew-home/agentic-reuse.git
 ```
 
-For local development:
+For a non-editable CLI-only installation:
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install --user git+https://github.com/pandew-home/agentic-reuse.git
 ```
+
+CLI-only installs do not install the agent skills. Clone the repository and run `./install-skills.sh` when agents need operation guidance or the authoring workflow.
 
 Python 3.10 or newer is required. The Python package has no third-party runtime dependencies. Individual operations call explicit external tools such as `aws`, `kubectl`, `argocd`, `helm`, Docker or Podman, `systemctl`, `journalctl`, and `glab`; run `agent-ops doctor` to inspect availability.
 
@@ -77,12 +91,12 @@ Project runbooks are discovered from the repository root at:
 .agent-ops/runbooks/*.json
 ```
 
-Project runbooks shadow user runbooks with the same name. List, validate, and execute them with:
+Project runbooks require explicit trust through `--scope project`; they do not silently shadow user runbooks. List, validate, and execute them with:
 
 ```bash
 agent-ops runbook list --scope all
 agent-ops runbook validate --file .agent-ops/runbooks/site-check.json
-agent-ops run site-check --param host=example.com
+agent-ops run site-check --scope project --param host=example.com
 ```
 
 A minimal `agent-ops/runbook-v1` document looks like this:
@@ -128,6 +142,15 @@ The repository includes usage and authoring skills in `skills/agent-ops/` and `s
 ```
 
 The installer updates only those two named skill directories. It is idempotent and does not remove unrelated skills or files.
+
+To update an editable agent installation:
+
+```bash
+git pull --ff-only
+pipx reinstall agentic-reuse
+./install-skills.sh
+agent-ops --version
+```
 
 ## Development
 

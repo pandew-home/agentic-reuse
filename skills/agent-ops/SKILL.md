@@ -12,7 +12,7 @@ Each operation centralizes command construction, parsing, bounds, redaction, and
 
 Do not reproduce an available operation with direct CLI calls. Run `agent-ops operations` when syntax or coverage is uncertain.
 
-Prefer `agent-ops run NAME` for repeatable multi-step checks. Runbooks reuse registered scripts without arbitrary shell; project runbooks shadow same-named user runbooks.
+Prefer `agent-ops run NAME` for repeatable multi-step checks. Runbooks reuse registered scripts without arbitrary shell; project runbooks require explicit `--scope project` trust.
 
 Supply every explicit target. Never substitute the current kube context, Argo context, GitLab host, or repository.
 
@@ -25,7 +25,7 @@ agent-ops doctor
 agent-ops operations
 agent-ops runbook list --scope user|project|all
 agent-ops runbook validate --file PATH
-agent-ops run NAME [--param NAME=VALUE]
+agent-ops run NAME [--scope user|project] [--param NAME=VALUE]
 agent-ops eks refresh --target ID --aws-profile PROFILE --region REGION --cluster CLUSTER
 agent-ops eks status --target ID
 agent-ops k8s health --target ID --namespace NS
@@ -50,7 +50,7 @@ agent-ops ci failures --host HOST --repo NAMESPACE/PROJECT --pipeline ID
 
 Multicluster runbooks declare each target's `id`, `argocd_context`, `apps`, `aws_profile`, `aws_region`, `eks_cluster`, and `namespace`. They never discover clusters or applications.
 
-`gitops.multicluster` is a runbook-only registered operation with `targets`, optional `concurrency`, and optional `fail_fast`; it may refresh stale managed kubeconfig caches before diagnostics.
+`gitops.multicluster` is a runbook-only registered operation with `targets`, optional `concurrency`, and optional `fail_fast`; it may refresh stale managed kubeconfig caches before diagnostics. Project runbooks require explicit `--scope project`.
 
 The only mutation is managed EKS kubeconfig generation under `~/.local/state/agent-ops/`; it does not alter clusters or `~/.kube/config`.
 

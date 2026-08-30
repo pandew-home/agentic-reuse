@@ -16,11 +16,34 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile sources and tests
         run: python -m compileall -q src tests
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+      - name: Build distributions
+        run: |
+          python -m pip install --disable-pip-version-check build
+          python -m build
+      - name: Verify wheel installation
+        run: |
+          python -m venv /tmp/agentic-reuse-wheel
+          /tmp/agentic-reuse-wheel/bin/pip install --disable-pip-version-check dist/*.whl
+          /tmp/agentic-reuse-wheel/bin/agent-ops --version
+          /tmp/agentic-reuse-wheel/bin/agent-ops operations
+      - name: Verify source distribution
+        run: |
+          python -m venv /tmp/agentic-reuse-sdist
+          /tmp/agentic-reuse-sdist/bin/pip install --disable-pip-version-check dist/*.tar.gz
+          /tmp/agentic-reuse-sdist/bin/agent-ops --version
+      - name: Verify skill installer
+        run: |
+          test_home=$(mktemp -d)
+          HOME="$test_home" ./install-skills.sh
+          test -f "$test_home/.agents/skills/agent-ops/SKILL.md"
+          test -f "$test_home/.agents/skills/agent-ops-author/SKILL.md"
+          test -f "$test_home/.claude/skills/agent-ops/SKILL.md"
+          test -f "$test_home/.claude/skills/agent-ops-author/SKILL.md"

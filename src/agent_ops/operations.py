@@ -2,6 +2,8 @@ import concurrent.futures
 import datetime as dt
 import fcntl
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 import pathlib
@@ -10,18 +12,32 @@ import socket
 import ssl
 import struct
 import tempfile
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from .core import Context, OpsError, bounded, finding, run, run_json
 from .registry import operation
 
-STATE_HOME = pathlib.Path(os.path.expanduser(os.environ.get("XDG_STATE_HOME", "~/.local/state"))) / "agent-ops"
+def _state_base():
+    configured = os.environ.get("XDG_STATE_HOME", "")
+    candidate = pathlib.Path(os.path.expanduser(configured)) if configured else None
+    if candidate is None or not candidate.is_absolute():
+        candidate = pathlib.Path.home() / ".local" / "state"
+    return candidate
+
+
+STATE_HOME = _state_base() / "agent-ops"
 KUBECONFIG_HOME = STATE_HOME / "kubeconfigs"
 EKS_STATE = STATE_HOME / "eks-state.json"
 STALE_SECONDS = 20 * 60 * 60
 ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+
+
+def _ensure_private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if path.is_symlink() or not path.is_dir() or info.st_uid != os.getuid():
+        raise OpsError("unsafe_state_directory", "Managed state directory must be a real owner-controlled directory", 3)
+    path.chmod(0o700)
 
 
 def _target_id(args):
@@ -50,7 +66,7 @@ def _load_state():
 
 
 def _save_state(value):
-    STATE_HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _ensure_private_dir(STATE_HOME)
     fd, name = tempfile.mkstemp(prefix="eks-state.", dir=STATE_HOME)
     try:
         os.fchmod(fd, 0o600)
@@ -63,7 +79,7 @@ def _save_state(value):
 
 
 def _update_state(target, entry):
-    STATE_HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _ensure_private_dir(STATE_HOME)
     lock_path = STATE_HOME / ".eks-state.lock"
     with lock_path.open("a+") as lock:
         os.chmod(lock_path, 0o600)
@@ -91,7 +107,7 @@ def eks_status_data(target):
     }
 
 
-@operation("eks.status", required=("target",), mutation="none")
+@operation("eks.status", required=("target",), runbook=True, mutation="none")
 def eks_status(ctx, args):
     target = _target_id(args)
     info = eks_status_data(target)
@@ -106,7 +122,8 @@ def eks_refresh(ctx, args):
     profile = _safe_value(args.get("aws_profile"), "AWS profile")
     region = _safe_value(args.get("region"), "AWS region")
     cluster = _safe_value(args.get("cluster"), "EKS cluster")
-    KUBECONFIG_HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _ensure_private_dir(STATE_HOME)
+    _ensure_private_dir(KUBECONFIG_HOME)
     lock_path = KUBECONFIG_HOME / f".{target}.lock"
     with lock_path.open("a+") as lock:
         os.chmod(lock_path, 0o600)
@@ -153,7 +170,7 @@ def _items(doc):
     return doc.get("items", []) if isinstance(doc, dict) else []
 
 
-@operation("k8s.health", required=("target", "namespace"), executables=("kubectl",), timeout=45)
+@operation("k8s.health", required=("target", "namespace"), executables=("kubectl",), runbook=True, timeout=45)
 def k8s_health(ctx, args):
     target, path = ensure_target(ctx, args)
     namespace = _safe_value(args.get("namespace"), "Kubernetes namespace")
@@ -204,11 +221,11 @@ def k8s_health(ctx, args):
         metrics = {"nodes": len(_items(node_metrics)), "pods": len(_items(pod_metrics))}
     except OpsError as exc:
         findings.append(finding("info", "metrics_unavailable", "Resource metrics are unavailable", target, {"reason": exc.code}))
-    status = "critical" if any(x["severity"] == "critical" for x in findings) else "degraded" if findings else "healthy"
+    status = "critical" if any(x["severity"] == "critical" for x in findings) else "degraded" if any(x["severity"] == "warning" for x in findings) else "healthy"
     return ctx.success(status=status, target={"id": target, "namespace": namespace}, summary={"nodes": len(nodes), "workloads": len(workloads), "pods": len(pods), "pod_phases": phases, "unhealthy_pods": len(unhealthy), "warnings": len(event_rows), "metrics": metrics}, findings=bounded(findings, ctx), data={"nodes": bounded(node_rows, ctx), "workloads": bounded(workload_rows, ctx), "unhealthy_pods": bounded(unhealthy, ctx), "warning_events": event_rows, "ingress": bounded([{"name": x.get("metadata", {}).get("name"), "hosts": [r.get("host") for r in x.get("spec", {}).get("rules", [])]} for x in ingresses], ctx)})
 
 
-@operation("k8s.workload", required=("target", "namespace", "kind", "name"), executables=("kubectl",), timeout=30)
+@operation("k8s.workload", required=("target", "namespace", "kind", "name"), executables=("kubectl",), runbook=True, timeout=30)
 def k8s_workload(ctx, args):
     target, path = ensure_target(ctx, args)
     namespace = _safe_value(args.get("namespace"), "Kubernetes namespace")
@@ -221,8 +238,25 @@ def k8s_workload(ctx, args):
     status = obj.get("status", {})
     desired = obj.get("spec", {}).get("replicas", status.get("desiredNumberScheduled"))
     ready = status.get("readyReplicas", status.get("numberReady"))
-    healthy = desired is None or ready == desired
-    findings = [] if healthy else [finding("critical", "workload_unavailable", "Workload has unavailable replicas", f"{kind}/{name}", {"desired": desired, "ready": ready})]
+    if kind == "job":
+        failed = status.get("failed", 0)
+        failure = next((condition for condition in status.get("conditions", []) if condition.get("type") == "Failed" and condition.get("status") == "True"), None)
+        complete = next((condition for condition in status.get("conditions", []) if condition.get("type") == "Complete" and condition.get("status") == "True"), None)
+        healthy = not failed and failure is None
+        desired = obj.get("spec", {}).get("completions", 1)
+        ready = status.get("succeeded", 0)
+        findings = [] if healthy else [finding("critical", "job_failed", "Job has failed", f"{kind}/{name}", {"failed": failed, "reason": (failure or {}).get("reason")})]
+        if complete is None and healthy:
+            findings.append(finding("info", "job_in_progress", "Job has not completed", f"{kind}/{name}", {"succeeded": ready, "desired": desired}))
+    elif kind == "cronjob":
+        suspended = bool(obj.get("spec", {}).get("suspend", False))
+        healthy = True
+        desired = None
+        ready = len(status.get("active", []))
+        findings = [finding("info", "cronjob_suspended", "CronJob is suspended", f"{kind}/{name}")] if suspended else []
+    else:
+        healthy = desired is None or ready == desired
+        findings = [] if healthy else [finding("critical", "workload_unavailable", "Workload has unavailable replicas", f"{kind}/{name}", {"desired": desired, "ready": ready})]
     labels = obj.get("spec", {}).get("selector", {}).get("matchLabels", {})
     pods = []
     if labels:
@@ -279,14 +313,18 @@ def _argo_summary(app, ctx):
         operation_data = {key: operation_state.get(key) for key in ("phase", "message", "startedAt", "finishedAt", "retryCount") if operation_state.get(key) is not None}
         sync_result = operation_state.get("syncResult", {})
         if sync_result:
-            operation_data["sync_result"] = {key: sync_result.get(key) for key in ("revision", "source") if sync_result.get(key) is not None}
+            operation_data["sync_result"] = {"revision": sync_result.get("revision")}
+            source = sync_result.get("source", {})
+            safe_source = {key: source.get(key) for key in ("repoURL", "path", "chart", "targetRevision") if source.get(key) is not None}
+            if safe_source:
+                operation_data["sync_result"]["source"] = safe_source
             operation_data["resource_results"] = bounded([{key: row.get(key) for key in ("group", "kind", "namespace", "name", "status", "message") if row.get(key) is not None} for row in sync_result.get("resources", [])], ctx, 25)
         details = {"conditions": bounded(status.get("conditions", []), ctx, 10), "operation": operation_data, "problematic_resources": bounded(problematic, ctx, 25)}
         findings.append(finding("critical" if health in ("Degraded", "Missing") else "warning", "argo_app_unhealthy", f"Application is {health} / {sync}", base["name"], {"health": health, "sync": sync}))
     return base, details, findings, healthy
 
 
-@operation("argo.app", required=("argocd_context", "app"), executables=("argocd",), timeout=30)
+@operation("argo.app", required=("argocd_context", "app"), executables=("argocd",), runbook=True, timeout=30)
 def argo_app(ctx, args):
     context = _safe_value(args.get("argocd_context"), "Argo CD context")
     app_name = _safe_value(args.get("app"), "Argo CD application")
@@ -295,7 +333,7 @@ def argo_app(ctx, args):
     return ctx.success(status="healthy" if healthy else "critical" if any(x["severity"] == "critical" for x in findings) else "degraded", target={"argocd_context": context, "app": app_name}, summary=summary, findings=findings, data=details)
 
 
-@operation("argo.history", required=("argocd_context", "app"), allowed=("limit",), executables=("argocd",), timeout=30)
+@operation("argo.history", required=("argocd_context", "app"), allowed=("limit",), executables=("argocd",), runbook=True, timeout=30)
 def argo_history(ctx, args):
     context = _safe_value(args.get("argocd_context"), "Argo CD context")
     app_name = _safe_value(args.get("app"), "Argo CD application")
@@ -308,7 +346,7 @@ def argo_history(ctx, args):
     return ctx.success(status="unknown", target={"argocd_context": context, "app": app_name}, summary={"revisions": len(safe)}, data={"history": safe})
 
 
-@operation("argo.diff", required=("argocd_context", "app"), executables=("argocd",), timeout=30)
+@operation("argo.diff", required=("argocd_context", "app"), executables=("argocd",), runbook=True, timeout=30)
 def argo_diff(ctx, args):
     context = _safe_value(args.get("argocd_context"), "Argo CD context")
     app_name = _safe_value(args.get("app"), "Argo CD application")
@@ -324,37 +362,47 @@ def argo_diff(ctx, args):
 
 def _refresh_if_needed(ctx, target):
     args = {"target": target["id"], "aws_profile": target["aws_profile"], "region": target["aws_region"], "cluster": target["eks_cluster"]}
-    if eks_status_data(target["id"])["stale"]:
+    status = eks_status_data(target["id"])
+    identity_changed = any((
+        status.get("aws_profile") != target["aws_profile"],
+        status.get("aws_region") != target["aws_region"],
+        status.get("eks_cluster") != target["eks_cluster"],
+    ))
+    if status["stale"] or identity_changed:
         eks_refresh(ctx, args)
 
 
-def _gitops_target(target):
+def _gitops_target(target, deadline=None):
     required = ("id", "argocd_context", "apps", "aws_profile", "aws_region", "eks_cluster", "namespace")
     if any(k not in target for k in required) or not isinstance(target.get("apps"), list) or not 1 <= len(target["apps"]) <= 20:
         raise OpsError("invalid_target", "Each GitOps target requires identity, AWS/EKS fields, Argo context, 1-20 apps, and namespace", 3)
     local = Context("gitops.target")
+    local.deadline = deadline
     try:
         _target_id({"target": target["id"]})
         _refresh_if_needed(local, target)
         kh = k8s_health(local, {"target": target["id"], "namespace": target["namespace"]})
         apps, findings = [], list(kh["findings"])
+        app_statuses = []
         for app_name in target["apps"]:
             result = argo_app(local, {"argocd_context": target["argocd_context"], "app": app_name})
+            app_statuses.append(result["status"])
             apps.append({"app": app_name, "status": result["status"], "summary": result["summary"], **({"findings": result["findings"], "data": result["data"]} if result["status"] != "healthy" else {})})
-            findings.extend(result["findings"])
+            local.truncated = local.truncated or result["meta"]["truncated"]
+            local.omitted += result["meta"]["omitted"]
             destination = result["summary"].get("destination", {})
             expected = target["eks_cluster"]
             observed = destination.get("name") or ""
             if observed and observed != expected:
                 mismatch = finding("critical", "destination_mismatch", "Argo application destination does not match expected EKS cluster", app_name, {"expected": expected, "observed": observed})
                 findings.append(mismatch)
-        status = "critical" if any(x["severity"] == "critical" for x in findings) else "degraded" if findings else "healthy"
-        return {"id": target["id"], "ok": True, "status": status, "kubernetes": kh["summary"], "apps": apps, "findings": findings, "commands_run": local.commands_run}
+        status = "critical" if "critical" in app_statuses or any(x["severity"] == "critical" for x in findings) else "degraded" if "degraded" in app_statuses or any(x["severity"] == "warning" for x in findings) else "healthy"
+        return {"id": target["id"], "ok": True, "status": status, "kubernetes": kh["summary"], "apps": apps, "findings": findings, "commands_run": local.commands_run, "truncated": local.truncated, "omitted": local.omitted, "dropped_bytes": local.dropped_bytes}
     except OpsError as exc:
-        return {"id": target.get("id"), "ok": False, "status": "error", "error": {"code": exc.code, "message": exc.message}, "commands_run": local.commands_run}
+        return {"id": target.get("id"), "ok": False, "status": "error", "error": {"code": exc.code, "message": exc.message}, "commands_run": local.commands_run, "truncated": local.truncated, "omitted": local.omitted, "dropped_bytes": local.dropped_bytes}
 
 
-@operation("gitops.multicluster", required=("targets",), allowed=("concurrency", "fail_fast"), executables=("aws", "kubectl", "argocd"), mutation="local_cache", timeout=300)
+@operation("gitops.multicluster", required=("targets",), allowed=("concurrency", "fail_fast"), executables=("aws", "kubectl", "argocd"), runbook=True, mutation="local_cache", timeout=300)
 def gitops_multicluster(ctx, args):
     targets = args.get("targets")
     if not isinstance(targets, list) or not 1 <= len(targets) <= 20:
@@ -366,14 +414,17 @@ def gitops_multicluster(ctx, args):
     if args.get("fail_fast"):
         results = []
         for target in targets:
-            result = _gitops_target(target)
+            result = _gitops_target(target, ctx.deadline)
             results.append(result)
             if not result["ok"]:
                 break
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(_gitops_target, targets))
+            results = list(pool.map(lambda target: _gitops_target(target, ctx.deadline), targets))
     ctx.commands_run += sum(x.pop("commands_run", 0) for x in results)
+    ctx.truncated = ctx.truncated or any(x.pop("truncated", False) for x in results)
+    ctx.omitted += sum(x.pop("omitted", 0) for x in results)
+    ctx.dropped_bytes += sum(x.pop("dropped_bytes", 0) for x in results)
     failed = sum(not x["ok"] for x in results)
     critical = sum(x["status"] == "critical" for x in results)
     status = "critical" if critical else "degraded" if failed else "healthy"
@@ -413,7 +464,7 @@ def _manifest_summary(text, ctx):
     return bounded(resources, ctx, 100), hashlib.sha256(text.encode()).hexdigest()
 
 
-@operation("helm.check", required=("chart", "release", "namespace"), allowed=("values",), executables=("helm",), timeout=60)
+@operation("helm.check", required=("chart", "release", "namespace"), allowed=("values",), executables=("helm",), runbook=True, timeout=60)
 def helm_check(ctx, args):
     chart, template = _helm_base(args)
     lint_args = ["helm", "lint", str(chart)]
@@ -428,7 +479,7 @@ def helm_check(ctx, args):
     return ctx.success(target={"chart": str(chart), "release": args["release"], "namespace": args["namespace"]}, summary={"resources": len(resources), "kinds": counts, "manifest_sha256": digest}, data={"lint": lint.splitlines()[-10:]})
 
 
-@operation("helm.render-summary", required=("chart", "release", "namespace"), allowed=("values",), executables=("helm",), timeout=60)
+@operation("helm.render-summary", required=("chart", "release", "namespace"), allowed=("values",), executables=("helm",), runbook=True, timeout=60)
 def helm_render(ctx, args):
     chart, template = _helm_base(args)
     rendered, _, _ = run(ctx, template, timeout=60)
@@ -443,7 +494,7 @@ def _engine(args):
     return engine
 
 
-@operation("container.status", required=("engine", "name"), executables=("docker|podman",))
+@operation("container.status", required=("engine", "name"), executables=("docker|podman",), runbook=True)
 def container_status(ctx, args):
     engine, name = _engine(args), _safe_value(args.get("name"), "Container name")
     rows = run_json(ctx, [engine, "inspect", name])
@@ -463,7 +514,7 @@ def container_logs(ctx, args):
     return ctx.success(status="unknown", target={"engine": engine, "name": name}, summary={"lines": len(rows)}, data={"lines": rows})
 
 
-@operation("compose.check", required=("engine", "file", "project"), executables=("docker|podman",), timeout=30)
+@operation("compose.check", required=("engine", "file", "project"), executables=("docker|podman",), runbook=True, timeout=30)
 def compose_check(ctx, args):
     engine, file, project = _engine(args), pathlib.Path(args.get("file", "")).expanduser().resolve(), _safe_value(args.get("project"), "Compose project")
     if not file.is_file() or not project:
@@ -481,7 +532,7 @@ def compose_check(ctx, args):
     return ctx.success(status="critical" if bad else "healthy", target={"engine": engine, "file": str(file), "project": project}, summary={"services": len(safe), "unhealthy": len(bad)}, findings=[finding("critical", "compose_unhealthy", "Compose services require attention", project, {"count": len(bad)})] if bad else [], data={"services": safe})
 
 
-@operation("service.status", required=("unit",), executables=("systemctl",))
+@operation("service.status", required=("unit",), executables=("systemctl",), runbook=True)
 def service_status(ctx, args):
     unit = _safe_value(args.get("unit"), "systemd unit")
     fields = "Id,LoadState,ActiveState,SubState,Result,MainPID,ExecMainStatus,NRestarts,UnitFileState"
@@ -599,7 +650,7 @@ def _dns_query(host, record_type):
     return records
 
 
-@operation("network.dns", required=("host",), allowed=("type",))
+@operation("network.dns", required=("host",), allowed=("type",), runbook=True)
 def network_dns(ctx, args):
     host, record_type = args.get("host"), args.get("type", "A")
     if record_type not in ("A", "AAAA", "CNAME", "MX", "TXT"):
@@ -609,34 +660,64 @@ def network_dns(ctx, args):
     return ctx.success(target={"host": host, "type": record_type}, summary={"records": len(records)}, data={"records": records})
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+def _resolve_public_http_host(host):
+    try:
+        addresses = {row[4][0] for row in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise OpsError("dns_failed", "HTTP target DNS lookup failed", 5, {"reason": str(exc)})
+    if not addresses:
+        raise OpsError("dns_failed", "HTTP target resolved to no addresses", 5)
+    public = []
+    for address in sorted(addresses):
+        try:
+            if not ipaddress.ip_address(address).is_global:
+                raise OpsError("unsafe_url", "HTTP target resolves to a non-public address", 3)
+            public.append(address)
+        except ValueError:
+            raise OpsError("unsafe_url", "HTTP target resolved to an invalid address", 3)
+    return public[0]
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, address, port, timeout):
+        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._address = address
+
+    def connect(self):
+        raw = socket.create_connection((self._address, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
 
 
 @operation("network.http", required=("url",), allowed=("method",))
 def network_http(ctx, args):
     url, method = args.get("url"), args.get("method", "HEAD")
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in ("http", "https") or parsed.username or parsed.password or method not in ("HEAD", "GET"):
-        raise OpsError("unsafe_url", "URL must be HTTP(S) without credentials and method HEAD or GET", 3)
-    request = urllib.request.Request(url, method=method, headers={"User-Agent": "agent-ops/1"})
-    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        response = opener.open(request, timeout=10)
-    except urllib.error.HTTPError as exc:
-        response = exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise OpsError("http_failed", "HTTP diagnostic failed", 5, {"reason": str(exc.reason if hasattr(exc, "reason") else exc)})
-    body = response.read(65537) if method == "GET" else b""
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except (TypeError, ValueError):
+        raise OpsError("unsafe_url", "URL is malformed", 3)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or method not in ("HEAD", "GET"):
+        raise OpsError("unsafe_url", "URL must be HTTP(S) without credentials and method HEAD or GET", 3)
+    address = _resolve_public_http_host(parsed.hostname)
+    path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    host_header = parsed.hostname if port in (80, 443) else f"{parsed.hostname}:{port}"
+    connection = _PinnedHTTPSConnection(parsed.hostname, address, port, 10) if parsed.scheme == "https" else http.client.HTTPConnection(address, port=port, timeout=10)
+    try:
+        connection.request(method, path, headers={"Host": host_header, "User-Agent": "agent-ops/1"})
+        response = connection.getresponse()
+        body = response.read(65537) if method == "GET" else b""
+    except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+        raise OpsError("http_failed", "HTTP diagnostic failed", 5, {"reason": str(exc)})
+    finally:
+        connection.close()
     if len(body) > 65536:
         body = body[:65536]
         ctx.truncated = True
-    safe_headers = {k.lower(): v for k, v in response.headers.items() if k.lower() in ("content-type", "content-length", "location", "server", "cache-control")}
+    safe_headers = {k.lower(): v for k, v in response.getheaders() if k.lower() in ("content-type", "content-length", "location", "server", "cache-control")}
     return ctx.success(status="healthy" if response.status < 400 else "degraded", target={"url": url, "method": method}, summary={"status": response.status, "headers": safe_headers, "body_bytes": len(body), "body_sha256": hashlib.sha256(body).hexdigest() if body else None})
 
 
-@operation("network.tls", required=("host",), allowed=("port", "server_name"))
+@operation("network.tls", required=("host",), allowed=("port", "server_name"), runbook=True)
 def network_tls(ctx, args):
     host = _safe_value(args.get("host"), "TLS host")
     port = int(args.get("port", 443))
@@ -661,7 +742,7 @@ def _project(repo):
     return urllib.parse.quote(repo, safe="")
 
 
-@operation("ci.status", required=("host", "repo"), allowed=("ref",), executables=("glab",), timeout=30)
+@operation("ci.status", required=("host", "repo"), allowed=("ref",), executables=("glab",), runbook=True, timeout=30)
 def ci_status(ctx, args):
     host, project = _safe_value(args.get("host"), "GitLab host"), _project(args.get("repo"))
     endpoint = f"projects/{project}/pipelines?per_page=10"
@@ -673,9 +754,11 @@ def ci_status(ctx, args):
     return ctx.success(status="degraded" if bad else "healthy", target={"host": host, "repo": args["repo"], "ref": args.get("ref")}, summary={"pipelines": len(safe), "failed": len(bad), "latest": safe[0] if safe else None}, findings=[finding("warning", "pipeline_failed", "Recent pipeline failed", str(x.get("id")), {"ref": x.get("ref")}) for x in bad], data={"pipelines": safe})
 
 
-@operation("ci.failures", required=("host", "repo", "pipeline"), executables=("glab",), timeout=30)
+@operation("ci.failures", required=("host", "repo", "pipeline"), executables=("glab",), runbook=True, timeout=30)
 def ci_failures(ctx, args):
     host, project, pipeline = _safe_value(args.get("host"), "GitLab host"), _project(args.get("repo")), _safe_value(str(args.get("pipeline")), "GitLab pipeline")
+    if not re.fullmatch(r"[1-9][0-9]*", pipeline):
+        raise OpsError("invalid_target", "GitLab pipeline must be a positive integer", 3)
     rows = run_json(ctx, ["glab", "api", "--hostname", host, f"projects/{project}/pipelines/{pipeline}/jobs?scope[]=failed&per_page=50"])
     safe = bounded([{k: x.get(k) for k in ("id", "name", "stage", "status", "failure_reason", "web_url", "duration")} for x in rows], ctx, 50)
     return ctx.success(status="critical" if safe else "healthy", target={"host": host, "repo": args["repo"], "pipeline": pipeline}, summary={"failed_jobs": len(safe)}, findings=[finding("critical", "job_failed", "GitLab job failed", x.get("name"), {"stage": x.get("stage"), "reason": x.get("failure_reason")}) for x in safe], data={"jobs": safe})

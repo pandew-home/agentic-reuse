@@ -7,14 +7,14 @@ description: Optimize token use by converting repeated safe DevOps reasoning and
 
 The primary goal is to spend tokens once on a reusable implementation instead of repeatedly constructing commands, parsing noisy output, and rediscovering the same diagnostic workflow.
 
-Extend the installed library without redesigning it. Inspect `~/.local/share/agent-ops/agent_ops/`, `tests/`, `agent-ops operations`, and the usage skill before editing. Preserve concurrent changes.
+Extend a source checkout without redesigning the library. Use the checkout supplied by the caller or clone `https://github.com/pandew-home/agentic-reuse.git`; do not infer a checkout from a pip/pipx launcher. Inspect `<checkout>/src/agent_ops/`, `<checkout>/tests/`, `agent-ops operations`, and the usage skill before editing. Never edit site-packages. Preserve concurrent changes.
 
 ## Compose First
 
 1. Identify repetition: commands rebuilt across sessions, verbose output repeatedly analyzed, duplicated fallback logic, and stable facts agents repeatedly extract.
 2. Record current output bytes and lines, sensitive fields, and the compact facts actually needed.
 3. Reuse an existing operation when possible. Otherwise compose registered operations in a constrained JSON runbook.
-4. Add Python only when composition cannot express the reusable workflow, and only under `~/.local/share/agent-ops/agent_ops/`. Never create one-off shell wrappers or auto-loaded repository Python plugins.
+4. Add Python only when composition cannot express the reusable workflow, and only under `<checkout>/src/agent_ops/`. Never create one-off shell wrappers, edit site-packages, or auto-load repository Python plugins.
 
 ## Safety Boundary
 
@@ -35,8 +35,9 @@ Measure canonical compact JSON bytes and lines against bounded raw output. Requi
 Before exposing an operation, run:
 
 ```bash
-python3 -m compileall -q ~/.local/share/agent-ops
-PYTHONPATH=~/.local/share/agent-ops python3 -m unittest discover -s ~/.local/share/agent-ops/tests -v
+cd <checkout>
+PYTHONPYCACHEPREFIX=/tmp/agentic-reuse-compile python3 -m compileall -q src tests
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 agent-ops operations
 ```
 

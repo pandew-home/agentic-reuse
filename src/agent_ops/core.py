@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import selectors
 import signal
 import subprocess
 import time
@@ -13,6 +14,7 @@ MAX_CAPTURE = 2_000_000
 ANSI_RE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SECRET_KEY_RE = re.compile(r"(?i)(authorization|password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)")
 TEXT_SECRET_RES = (
+    re.compile(r'(?i)(["\'](?:authorization|password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)["\']\s*:\s*)(["\'])(?:\\.|(?!\2).)*\2'),
     re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?\S+"),
     re.compile(r"(?i)((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|credential)\s*[:=]\s*)\S+"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
@@ -37,20 +39,31 @@ class Context:
     commands_run: int = 0
     truncated: bool = False
     omitted: int = 0
+    dropped_bytes: int = 0
+    deadline: float | None = None
 
     def success(self, *, status="healthy", target=None, summary=None, findings=None, data=None):
         return envelope(
             self, True, status, target or {}, summary or {}, findings or [], data or {}
         )
 
+    def remaining(self, requested: float) -> float:
+        if self.deadline is None:
+            return requested
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise OpsError("command_timeout", "Diagnostic operation exceeded its deadline", 5)
+        return min(requested, remaining)
+
 
 def redact_text(value: str, limit=MAX_STRING) -> str:
     value = ANSI_RE.sub("", str(value))
-    value = TEXT_SECRET_RES[0].sub(r"\1[REDACTED]", value)
+    value = TEXT_SECRET_RES[0].sub(r'\1\2[REDACTED]\2', value)
     value = TEXT_SECRET_RES[1].sub(r"\1[REDACTED]", value)
-    value = TEXT_SECRET_RES[2].sub("[REDACTED]", value)
-    value = TEXT_SECRET_RES[3].sub("[REDACTED PRIVATE KEY]", value)
-    value = TEXT_SECRET_RES[4].sub(r"\1[REDACTED]@", value)
+    value = TEXT_SECRET_RES[2].sub(r"\1[REDACTED]", value)
+    value = TEXT_SECRET_RES[3].sub("[REDACTED]", value)
+    value = TEXT_SECRET_RES[4].sub("[REDACTED PRIVATE KEY]", value)
+    value = TEXT_SECRET_RES[5].sub(r"\1[REDACTED]@", value)
     return value[:limit] if limit is not None else value
 
 
@@ -91,6 +104,7 @@ def envelope(ctx, ok, status, target, summary, findings, data, error=None):
             "commands_run": ctx.commands_run,
             "truncated": ctx.truncated,
             "omitted": ctx.omitted,
+            "dropped_bytes": ctx.dropped_bytes,
         },
     }
     if error is not None:
@@ -113,6 +127,63 @@ def narrow_env():
     return env
 
 
+def _stop_process_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
+def _read_bounded(ctx, proc, timeout):
+    deadline = time.monotonic() + ctx.remaining(timeout)
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    selector = selectors.DefaultSelector()
+    for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, name)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            events = selector.select(remaining)
+            if not events and proc.poll() is None:
+                continue
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer = buffers[key.data]
+                available = max(0, MAX_CAPTURE - len(buffer))
+                retained = min(len(chunk), available)
+                buffer.extend(chunk[:retained])
+                dropped = len(chunk) - retained
+                if dropped:
+                    ctx.truncated = True
+                    ctx.dropped_bytes += dropped
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        proc.wait(timeout=remaining)
+        return bytes(buffers["stdout"]), bytes(buffers["stderr"])
+    finally:
+        selector.close()
+
+
 def run(ctx: Context, argv, timeout=20, input_text=None, allowed_codes=(0,), redact_stdout=True):
     ctx.commands_run += 1
     try:
@@ -129,17 +200,17 @@ def run(ctx: Context, argv, timeout=20, input_text=None, allowed_codes=(0,), red
     except FileNotFoundError:
         raise OpsError("dependency_missing", f"Required executable is not installed: {argv[0]}", 4)
     try:
-        out, err = proc.communicate(input_text.encode() if input_text is not None else None, timeout=timeout)
+        if input_text is not None:
+            proc.stdin.write(input_text.encode())
+            proc.stdin.close()
+        out, err = _read_bounded(ctx, proc, timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+        _stop_process_group(proc)
         raise OpsError("command_timeout", f"Diagnostic command exceeded {timeout}s", 5, {"executable": argv[0]})
-    if len(out) > MAX_CAPTURE or len(err) > MAX_CAPTURE:
-        ctx.truncated = True
-        out, err = out[:MAX_CAPTURE], err[:MAX_CAPTURE]
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
     stdout = out.decode("utf-8", "replace")
     if redact_stdout:
         stdout = redact_text(stdout, None)
